@@ -144,6 +144,15 @@ pub struct Agent {
     #[serde(default)]
     pub container_pipe_size: u32,
 
+    /// Additional environment variables to set in the guest VM, written to
+    /// `/etc/environment`.
+    ///
+    /// Each entry should be in `KEY=VALUE` format. These are made available
+    /// system-wide inside the guest so that hooks and other guest-level
+    /// processes can use them.
+    #[serde(default)]
+    pub guest_env: Vec<String>,
+
     /// Memory agent configuration
     #[serde(default)]
     pub mem_agent: MemAgent,
@@ -178,6 +187,7 @@ impl std::default::Default for Agent {
             health_check_request_timeout_ms: 90_000,
             kernel_modules: Default::default(),
             container_pipe_size: 0,
+            guest_env: Default::default(),
             mem_agent: MemAgent::default(),
             policy: Default::default(),
         }

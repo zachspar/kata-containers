@@ -80,6 +80,20 @@ pub const KATA_ANNO_CFG_AGENT_CONTAINER_PIPE_SIZE: &str =
 /// An annotation key to specify the size of the pipes created for containers.
 pub const CONTAINER_PIPE_SIZE_KERNEL_PARAM: &str = "agent.container_pipe_size";
 
+/// An annotation key for specifying additional environment variables to set in
+/// the guest VM (the sandbox host), written to `/etc/environment`.
+///
+/// The value is a JSON object mapping variable names to their values.
+/// These variables are made available system-wide inside the guest VM so that
+/// hooks, agent-spawned processes, and any other guest-level operations can
+/// use them. They are *added* without overwriting variables that are already
+/// set.
+///
+///   annotations:
+///     io.katacontainers.config.agent.guest_env: '{"HTTPS_PROXY":"http://proxy:8080","NO_PROXY":"localhost"}'
+pub const KATA_ANNO_CFG_AGENT_GUEST_ENV: &str =
+    "io.katacontainers.config.agent.guest_env";
+
 // Hypervisor related annotations
 /// Prefix for Hypervisor configurations.
 pub const KATA_ANNO_CFG_HYPERVISOR_PREFIX: &str = "io.katacontainers.config.hypervisor.";
@@ -1018,6 +1032,18 @@ impl Annotation {
                             value.split(';').map(str::to_string).collect();
                         for modules in kernel_mod {
                             ag.kernel_modules.push(modules.to_string());
+                        }
+                    }
+                    KATA_ANNO_CFG_AGENT_GUEST_ENV => {
+                        let env_map: HashMap<String, String> =
+                            serde_json::from_str(value).map_err(|e| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!("invalid JSON for {key}: {e}"),
+                                )
+                            })?;
+                        for (k, v) in env_map {
+                            ag.guest_env.push(format!("{k}={v}"));
                         }
                     }
                     KATA_ANNO_CFG_AGENT_TRACE => match self.get_value::<bool>(key) {

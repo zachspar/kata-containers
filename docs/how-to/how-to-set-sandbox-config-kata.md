@@ -37,6 +37,7 @@ There are several kinds of Kata configurations and they are listed below.
 | `io.katacontainers.config.agent.container_pipe_size` | uint32 | specify the size of the std(in/out) pipes created for containers |
 | `io.katacontainers.config.agent.kernel_modules` | string | the list of kernel modules and their parameters that will be loaded in the guest kernel. Semicolon separated list of kernel modules and their parameters. These modules will be loaded in the guest kernel using `modprobe`(8). E.g., `e1000e InterruptThrottleRate=3000,3000,3000 EEE=1; i915 enable_ppgtt=0` |
 | `io.katacontainers.config.agent.cdh_api_timeout` | uint32 | timeout in second for Confidential Data Hub (CDH) API service, default is `50` |
+| `io.katacontainers.config.agent.guest_env` | JSON string | a JSON object of key-value pairs specifying environment variables to set in the guest VM, written to `/etc/environment` on the guest. These are **not** visible inside containers — they are available to guest hooks and agent-spawned processes only. Variables are added without replacing existing ones. E.g., `'{"HTTPS_PROXY":"http://proxy:8080","NO_PROXY":"localhost"}'` |
 
 ## Hypervisor Options
 | Key | Value Type | Comments |
@@ -185,6 +186,35 @@ spec:
   runtimeClassName: kata
   containers:
   - name: c2
+    image: busybox
+    command:
+      - sh
+    stdin: true
+    tty: true
+```
+
+## Setting guest VM environment variables
+
+The `io.katacontainers.config.agent.guest_env` annotation sets environment
+variables inside the guest VM itself (the sandbox host), **not** inside
+containers. The variables are written to `/etc/environment` in the guest and
+set in the agent's process environment so that guest hooks and any other
+agent-spawned processes can use them.
+
+> **Note:** These variables are not visible from within the container
+> filesystem. They exist only on the guest VM that hosts the sandbox.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-with-guest-env
+  annotations:
+    io.katacontainers.config.agent.guest_env: '{"HTTPS_PROXY":"http://proxy:8080","NO_PROXY":"localhost,10.0.0.0/8"}'
+spec:
+  runtimeClassName: kata
+  containers:
+  - name: app
     image: busybox
     command:
       - sh

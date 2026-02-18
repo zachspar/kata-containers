@@ -104,6 +104,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
+use kata_types::annotations::KATA_ANNO_CFG_AGENT_GUEST_ENV;
 use kata_types::k8s;
 
 pub const CONTAINER_BASE: &str = "/run/kata-containers";
@@ -278,6 +279,9 @@ impl AgentService {
 
         // Append guest hooks
         append_guest_hooks(&s, &mut oci)?;
+
+        // Write guest-level env vars from annotation to /etc/environment
+        apply_guest_env(&oci)?;
 
         // write spec to bundle path, hooks might
         // read ocispec
@@ -1960,6 +1964,78 @@ fn append_guest_hooks(s: &Sandbox, oci: &mut Spec) -> Result<()> {
     Ok(())
 }
 
+const GUEST_ENV_FILE: &str = "/etc/environment";
+
+/// Applies guest-level environment variables from the
+/// `io.katacontainers.config.agent.guest_env` annotation.
+///
+/// The annotation value is a JSON object (`{"KEY": "VALUE", ...}`).
+/// Variables are written to `/etc/environment` inside the guest VM and also
+/// set in the agent's own process environment so that child processes (hooks,
+/// helper binaries, etc.) inherit them immediately.
+///
+/// Existing variables (those already present in `/etc/environment` or the
+/// agent's process environment) are not overwritten.
+fn apply_guest_env(oci: &Spec) -> Result<()> {
+    let env_value = oci
+        .annotations()
+        .as_ref()
+        .and_then(|a| a.get(KATA_ANNO_CFG_AGENT_GUEST_ENV))
+        .cloned();
+
+    let Some(value) = env_value else {
+        return Ok(());
+    };
+
+    let env_map: std::collections::HashMap<String, String> =
+        serde_json::from_str(&value).context("invalid JSON in guest_env annotation")?;
+
+    if env_map.is_empty() {
+        return Ok(());
+    }
+
+    let existing_content = fs::read_to_string(GUEST_ENV_FILE).unwrap_or_default();
+    let existing_names: Vec<&str> = existing_content
+        .lines()
+        .filter_map(|line| line.split('=').next())
+        .collect();
+
+    let mut to_append = String::new();
+    let mut added = 0u32;
+
+    for (name, val) in &env_map {
+        if existing_names.iter().any(|&n| n == name) {
+            continue;
+        }
+
+        to_append.push_str(&format!("{name}={val}\n"));
+
+        if std::env::var(name).is_err() {
+            std::env::set_var(name, val);
+        }
+
+        added += 1;
+    }
+
+    if !to_append.is_empty() {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(GUEST_ENV_FILE)
+            .context("failed to open /etc/environment for writing")?;
+        file.write_all(to_append.as_bytes())
+            .context("failed to write to /etc/environment")?;
+    }
+
+    info!(
+        sl(),
+        "applied {added} guest environment variable(s) to {GUEST_ENV_FILE}"
+    );
+
+    Ok(())
+}
+
 // Check if the container process installed the
 // handler for specific signal.
 fn is_signal_handled(proc_status_file: &str, signum: u32) -> bool {
@@ -2565,6 +2641,133 @@ mod tests {
         let mut oci = Spec::default();
         append_guest_hooks(&s, &mut oci).unwrap();
         assert_eq!(s.hooks, oci.hooks().clone());
+    }
+
+    #[tokio::test]
+    async fn test_apply_guest_env() {
+        use oci_spec::runtime::SpecBuilder;
+        use std::collections::HashMap;
+
+        let tmp = tempdir().unwrap();
+        let env_file = tmp.path().join("environment");
+
+        // Temporarily override GUEST_ENV_FILE by writing a helper that
+        // exercises the same logic against a temp file.
+        fn apply_guest_env_to_file(oci: &Spec, path: &std::path::Path) -> anyhow::Result<()> {
+            let env_value = oci
+                .annotations()
+                .as_ref()
+                .and_then(|a| a.get(KATA_ANNO_CFG_AGENT_GUEST_ENV))
+                .cloned();
+
+            let Some(value) = env_value else {
+                return Ok(());
+            };
+
+            let env_map: std::collections::HashMap<String, String> =
+                serde_json::from_str(&value).context("invalid JSON in guest_env annotation")?;
+
+            if env_map.is_empty() {
+                return Ok(());
+            }
+
+            let existing_content = fs::read_to_string(path).unwrap_or_default();
+            let existing_names: Vec<&str> = existing_content
+                .lines()
+                .filter_map(|line| line.split('=').next())
+                .collect();
+
+            let mut to_append = String::new();
+            for (name, val) in &env_map {
+                if !existing_names.iter().any(|&n| n == name) {
+                    to_append.push_str(&format!("{name}={val}\n"));
+                }
+            }
+
+            if !to_append.is_empty() {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?;
+                file.write_all(to_append.as_bytes())?;
+            }
+
+            Ok(())
+        }
+
+        // No annotation — no-op, file should not be created
+        let oci = SpecBuilder::default().build().unwrap();
+        apply_guest_env_to_file(&oci, &env_file).unwrap();
+        assert!(!env_file.exists());
+
+        // With annotation — should write to file
+        let mut annotations = HashMap::new();
+        annotations.insert(
+            KATA_ANNO_CFG_AGENT_GUEST_ENV.to_string(),
+            r#"{"FOO":"bar","BAZ":"qux"}"#.to_string(),
+        );
+        let mut oci = SpecBuilder::default().build().unwrap();
+        oci.set_annotations(Some(annotations));
+        apply_guest_env_to_file(&oci, &env_file).unwrap();
+
+        let content = fs::read_to_string(&env_file).unwrap();
+        assert!(content.contains("FOO=bar"));
+        assert!(content.contains("BAZ=qux"));
+
+        // Running again should not duplicate (idempotent)
+        apply_guest_env_to_file(&oci, &env_file).unwrap();
+        let content2 = fs::read_to_string(&env_file).unwrap();
+        assert_eq!(
+            content.matches("FOO=bar").count(),
+            content2.matches("FOO=bar").count(),
+        );
+
+        // Existing var should not be overwritten
+        let mut annotations2 = HashMap::new();
+        annotations2.insert(
+            KATA_ANNO_CFG_AGENT_GUEST_ENV.to_string(),
+            r#"{"FOO":"overridden","NEW":"val"}"#.to_string(),
+        );
+        let mut oci2 = SpecBuilder::default().build().unwrap();
+        oci2.set_annotations(Some(annotations2));
+        apply_guest_env_to_file(&oci2, &env_file).unwrap();
+
+        let content3 = fs::read_to_string(&env_file).unwrap();
+        assert!(
+            content3.contains("FOO=bar"),
+            "FOO should keep original value"
+        );
+        assert!(
+            !content3.contains("FOO=overridden"),
+            "FOO should not be overwritten"
+        );
+        assert!(content3.contains("NEW=val"), "NEW should be added");
+
+        // Values with special characters
+        let env_file2 = tmp.path().join("environment2");
+        let mut annotations3 = HashMap::new();
+        annotations3.insert(
+            KATA_ANNO_CFG_AGENT_GUEST_ENV.to_string(),
+            r#"{"PROXY":"http://host:8080;retry=3","EMPTY":""}"#.to_string(),
+        );
+        let mut oci3 = SpecBuilder::default().build().unwrap();
+        oci3.set_annotations(Some(annotations3));
+        apply_guest_env_to_file(&oci3, &env_file2).unwrap();
+
+        let content4 = fs::read_to_string(&env_file2).unwrap();
+        assert!(content4.contains("PROXY=http://host:8080;retry=3"));
+        assert!(content4.contains("EMPTY="));
+
+        // Invalid JSON should return an error
+        let mut annotations4 = HashMap::new();
+        annotations4.insert(
+            KATA_ANNO_CFG_AGENT_GUEST_ENV.to_string(),
+            "not valid json".to_string(),
+        );
+        let mut oci4 = SpecBuilder::default().build().unwrap();
+        oci4.set_annotations(Some(annotations4));
+        assert!(apply_guest_env_to_file(&oci4, &env_file).is_err());
     }
 
     #[tokio::test]

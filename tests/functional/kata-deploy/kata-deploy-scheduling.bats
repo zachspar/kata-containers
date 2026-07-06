@@ -162,13 +162,64 @@ EOF
 	render_chart -f "${values_file}" --set node-feature-discovery.enabled=true
 	rm -f "${values_file}"
 
-	local ds
+	local ds term_count
 	ds=$(extract_kata_deploy_ds)
+	term_count=$(count_required_node_selector_terms "${ds}")
 
+	[[ "${term_count}" -eq 6 ]]
 	echo "${ds}" | grep -q "node.cloud/reserved"
 	echo "${ds}" | grep -q "platform-team"
 	echo "${ds}" | grep -q "feature.node.kubernetes.io/cpu-cpuid.VMX"
 	echo "${ds}" | grep -q "feature.node.kubernetes.io/cpu-cpuid.SVM"
+}
+
+@test "Helm template: NFD enabled applies virtualization nodeAffinity when user sets no affinity" {
+	render_chart --set node-feature-discovery.enabled=true
+
+	local ds term_count
+	ds=$(extract_kata_deploy_ds)
+	term_count=$(count_required_node_selector_terms "${ds}")
+
+	[[ "${term_count}" -eq 6 ]]
+	echo "${ds}" | grep -q "affinity:"
+	echo "${ds}" | grep -q "feature.node.kubernetes.io/cpu-cpuid.VMX"
+	echo "${ds}" | grep -q "feature.node.kubernetes.io/cpu-cpuid.SVM"
+}
+
+@test "Helm template: NFD merge preserves podAntiAffinity" {
+	local values_file
+	values_file=$(mktemp)
+	cat > "${values_file}" <<EOF
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: node.cloud/reserved
+              operator: In
+              values:
+                - platform-team
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchExpressions:
+            - key: app
+              operator: In
+              values:
+                - gpu-operator
+        topologyKey: kubernetes.io/hostname
+EOF
+
+	render_chart -f "${values_file}" --set node-feature-discovery.enabled=true
+	rm -f "${values_file}"
+
+	local ds
+	ds=$(extract_kata_deploy_ds)
+
+	echo "${ds}" | grep -q "podAntiAffinity:"
+	echo "${ds}" | grep -q "gpu-operator"
+	echo "${ds}" | grep -q "platform-team"
+	echo "${ds}" | grep -q "feature.node.kubernetes.io/cpu-cpuid.VMX"
 }
 
 @test "Helm template: NFD merge preserves matchFields in nodeSelectorTerms" {
